@@ -11,6 +11,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.counter_causal_dsa import active_counter_runtime
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -173,6 +174,9 @@ def sparse_attn_indexer(
         )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    counter = active_counter_runtime()
+    if counter is not None:
+        counter.start_indexer(k_cache_prefix)
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -193,7 +197,8 @@ def sparse_attn_indexer(
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
-            if not chunk.skip_kv_gather:
+            needs_native = counter is None or counter.needs_native_prefill(chunk)
+            if needs_native and (not chunk.skip_kv_gather or counter is not None):
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_quant,
@@ -218,7 +223,14 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if current_platform.is_xpu():
+            if not needs_native:
+                logits = torch.full(
+                    (chunk.token_end - chunk.token_start, chunk.total_seq_lens),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+            elif current_platform.is_xpu():
                 if q_scale_slice is not None:
                     raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                 logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -238,6 +250,8 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ke,
                     clean_logits=False,
                 )
+            if counter is not None:
+                logits = counter.apply_prefill(logits, chunk)
             num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[
@@ -305,7 +319,17 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        needs_native = counter is None or counter.needs_native_decode(num_padded_tokens)
+        if not needs_native:
+            # Match native top-k's row count and preserve its length masking.
+            width = (attn_metadata_narrowed.max_seq_len + 3) // 4 * 4
+            logits = torch.full(
+                (num_padded_tokens, width),
+                float("-inf"),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -331,6 +355,8 @@ def sparse_attn_indexer(
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
+        if counter is not None:
+            logits = counter.apply_decode(logits, seq_lens)
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 

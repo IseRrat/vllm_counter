@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -58,6 +58,11 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.counter_causal_dsa import (
+    counter_dsa_enabled,
+    counter_dummy_run,
+    counter_input_batch,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -4261,6 +4266,9 @@ class GPUModelRunner(
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
+            counter_input_batch(self.input_batch)
+            if counter_dsa_enabled(self.vllm_config)
+            else nullcontext(),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -5874,6 +5882,9 @@ class GPUModelRunner(
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                counter_dummy_run()
+                if counter_dsa_enabled(self.vllm_config)
+                else nullcontext(),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,

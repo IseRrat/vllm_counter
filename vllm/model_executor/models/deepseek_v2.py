@@ -26,6 +26,7 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from itertools import islice
 
 import torch
@@ -47,6 +48,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.counter_causal_dsa import (
+    CounterDSAConfig,
+    CounterDSARuntime,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -1628,6 +1633,15 @@ class DeepseekV2ForCausalLM(
         self.config = config
         self.quant_config = quant_config
 
+        counter_config = CounterDSAConfig.from_vllm(vllm_config)
+        if counter_config is not None:
+            if config.model_type != "deepseek_v32" or not hasattr(config, "index_topk"):
+                raise ValueError("counter_dsa is supported only for DeepSeek V3.2 MLA")
+            CounterDSARuntime.validate_support(vllm_config, counter_config)
+            # Explicit user override, before selection buffers/backends are built.
+            config.index_topk = counter_config.topk_tokens
+        self._counter_tp_size = vllm_config.parallel_config.tensor_parallel_size
+
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
         self.use_mha = config.model_type == "deepseek" or all(
@@ -1672,6 +1686,12 @@ class DeepseekV2ForCausalLM(
         )
         self.set_moe_parameters()
 
+        self.counter_runtime = (
+            CounterDSARuntime(self, vllm_config, counter_config)
+            if counter_config is not None
+            else None
+        )
+
     def set_moe_parameters(self):
         self.expert_weights = []
 
@@ -1710,9 +1730,15 @@ class DeepseekV2ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+        counter_context = (
+            self.counter_runtime.step(input_ids, positions)
+            if self.counter_runtime is not None
+            else nullcontext()
         )
+        with counter_context:
+            hidden_states = self.model(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
         return hidden_states
 
     def compute_logits(
